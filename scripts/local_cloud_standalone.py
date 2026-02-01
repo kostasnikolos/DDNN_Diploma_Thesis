@@ -168,7 +168,7 @@ if __name__ == '__main__':
         train_loader=train_loader,
         test_loader=test_loader,
         val_loader=val_loader,
-        methods_to_test=['local_standalone', 'cloud_standalone','random'],
+        methods_to_test=['local_standalone', 'cloud_standalone','oracle'],
         device='cuda',
         offload_epochs=OFFLOAD_EPOCHS,
         batch_size=BATCH_SIZE,

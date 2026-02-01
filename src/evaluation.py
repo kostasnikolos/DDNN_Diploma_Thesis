@@ -3481,5 +3481,436 @@ def plot_timing_results(results: Dict, L0: float, dataset_name: str, N_test: int
     print(f"{'='*80}")
 
 
+# ========================================================================
+# COST-BASED vs ORACLE LABELING COMPARISON (Figure 5.5 & 5.6 combined)
+# ========================================================================
+
+def compare_labeling_methods(
+    local_feature_extractor,
+    local_classifier,
+    cloud_cnn,
+    train_loader,
+    val_loader,
+    test_loader,
+    *,
+    L0: float = 0.54,
+    input_mode: str = 'logits_plus',
+    offload_epochs: int = 50,
+    batch_size: int = 256,
+    device: str = 'cuda',
+    dataset_name: str = 'cifar10',
+    plot: bool = True,
+    num_classes: int = 10
+) -> Dict:
+    """
+    Compare Cost-Based Rule vs Oracle Labeling Rule for offload mechanism training.
+    
+    This function:
+    1. Computes the Noise Rate: % of samples where bk-cost rule disagrees with Oracle
+    2. Trains offload mechanism with BOTH labeling methods (2 separate trainings)
+    3. Evaluates DDNN Overall Accuracy for each method
+    4. Creates comparison plots (Figure 5.5 style)
+    
+    Parameters
+    ----------
+    L0 : float
+        Target local processing ratio (used to compute b_star threshold)
+    input_mode : str
+        Input mode for offload mechanism ('logits', 'logits_plus', 'hybrid', etc.)
+    offload_epochs : int
+        Number of epochs to train each offload mechanism
+    
+    Returns
+    -------
+    dict
+        Results including noise_rate, accuracies for both methods, etc.
+    """
+    
+    print(f"\n{'='*80}")
+    print(f"COST-BASED vs ORACLE LABELING COMPARISON")
+    print(f"{'='*80}")
+    print(f"Settings: L0={L0:.2f}, input_mode={input_mode}, epochs={offload_epochs}")
+    print(f"Dataset: {dataset_name.upper()}")
+    
+    # ================================================================
+    # STEP 1: Compute bk values and b_star from training data
+    # ================================================================
+    local_feature_extractor.eval()
+    local_classifier.eval()
+    cloud_cnn.eval()
+    
+    print(f"\n[Step 1] Computing bk values from training data...")
+    
+    with torch.no_grad():
+        all_features, all_bks, all_labels, all_logits, all_images = \
+            compute_bks_input_for_deep_offload(
+                local_feature_extractor, local_classifier, cloud_cnn,
+                train_loader, method=0, device=device
+            )
+    
+    b_star = calculate_b_star(all_bks, L0)
+    print(f"  Computed b_star: {b_star:.4f}")
+    
+    # ================================================================
+    # STEP 2: Compute Noise Rate (disagreement between methods)
+    # ================================================================
+    print(f"\n[Step 2] Computing Noise Rate (Cost-Based vs Oracle)...")
+    
+    N_total = 0
+    N_agree = 0
+    N_disagree = 0
+    
+    # Also track label distributions
+    bk_local_count = 0
+    bk_cloud_count = 0
+    oracle_local_count = 0
+    oracle_cloud_count = 0
+    
+    with torch.no_grad():
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            bs = labels.size(0)
+            
+            # Forward pass
+            local_feats = local_feature_extractor(images)
+            local_out = local_classifier(local_feats)
+            cloud_out = cloud_cnn(local_feats)
+            
+            # Compute bk values
+            local_probs = F.softmax(local_out, dim=1)
+            cloud_probs = F.softmax(cloud_out, dim=1)
+            local_prob_correct = local_probs[range(bs), labels]
+            cloud_prob_correct = cloud_probs[range(bs), labels]
+            bk = (1.0 - local_prob_correct) - (1.0 - cloud_prob_correct)
+            
+            # Cost-Based Rule: bk >= b_star → cloud (1), else local (0)
+            bk_decisions = (bk >= b_star).float()
+            
+            # Oracle Rule: knows ground truth
+            oracle_decisions = my_oracle_decision_function(
+                local_out, cloud_out, labels, b_star=b_star
+            ).float()
+            
+            # Agreement/Disagreement
+            agreement_mask = (bk_decisions == oracle_decisions)
+            N_agree += agreement_mask.sum().item()
+            N_disagree += (~agreement_mask).sum().item()
+            N_total += bs
+            
+            # Label distributions
+            bk_local_count += (bk_decisions == 0).sum().item()
+            bk_cloud_count += (bk_decisions == 1).sum().item()
+            oracle_local_count += (oracle_decisions == 0).sum().item()
+            oracle_cloud_count += (oracle_decisions == 1).sum().item()
+    
+    noise_rate = 100 * N_disagree / N_total
+    agreement_rate = 100 * N_agree / N_total
+    
+    bk_local_pct = 100 * bk_local_count / N_total
+    bk_cloud_pct = 100 * bk_cloud_count / N_total
+    oracle_local_pct = 100 * oracle_local_count / N_total
+    oracle_cloud_pct = 100 * oracle_cloud_count / N_total
+    
+    print(f"\n  📊 LABELING COMPARISON:")
+    print(f"  {'─'*50}")
+    print(f"  Total training samples: {N_total:,}")
+    print(f"  Agreement (Cost-Based == Oracle): {N_agree:,} ({agreement_rate:.1f}%)")
+    print(f"  Disagreement (Noise Rate):        {N_disagree:,} ({noise_rate:.1f}%)")
+    print(f"  {'─'*50}")
+    print(f"  Cost-Based Rule distribution: Local={bk_local_pct:.1f}%, Cloud={bk_cloud_pct:.1f}%")
+    print(f"  Oracle Rule distribution:     Local={oracle_local_pct:.1f}%, Cloud={oracle_cloud_pct:.1f}%")
+    
+    # ================================================================
+    # STEP 3: Create meta-datasets with both labeling methods
+    # ================================================================
+    print(f"\n[Step 3] Creating meta-datasets...")
+    
+    combined_data = create_3d_data_deep(
+        all_bks, all_features, all_logits, all_images, all_labels,
+        input_mode=input_mode
+    )
+    
+    # Meta-dataset 1: Cost-Based (bk-threshold) labeling
+    offload_dataset_bk = OffloadDatasetCNN(
+        combined_data, b_star,
+        input_mode=input_mode,
+        include_bk=False,
+        use_oracle_labels=False,  # Use bk-threshold labels
+        local_clf=local_classifier,
+        cloud_clf=cloud_cnn,
+        device=device
+    )
+    
+    # Meta-dataset 2: Oracle labeling
+    offload_dataset_oracle = OffloadDatasetCNN(
+        combined_data, b_star,
+        input_mode=input_mode,
+        include_bk=False,
+        use_oracle_labels=True,  # Use oracle labels
+        local_clf=local_classifier,
+        cloud_clf=cloud_cnn,
+        device=device
+    )
+    
+    offload_loader_bk = DataLoader(offload_dataset_bk, batch_size=batch_size, shuffle=True)
+    offload_loader_oracle = DataLoader(offload_dataset_oracle, batch_size=batch_size, shuffle=True)
+    
+    print(f"  Created 2 meta-datasets:")
+    print(f"    - Cost-Based labeling: {len(offload_dataset_bk)} samples")
+    print(f"    - Oracle labeling:     {len(offload_dataset_oracle)} samples")
+    
+    # ================================================================
+    # STEP 4: Train offload mechanism with Cost-Based labels
+    # ================================================================
+    print(f"\n[Step 4a] Training offload mechanism with COST-BASED labels...")
+    
+    offload_model_bk = OffloadMechanism(
+        input_mode=input_mode,
+        num_classes=num_classes
+    ).to(device)
+    
+    optimizer_bk = torch.optim.Adam(offload_model_bk.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler_bk = ReduceLROnPlateau(optimizer_bk, mode='max', factor=0.7, patience=5)
+    
+    train_deep_offload_mechanism(
+        offload_model_bk, val_loader, optimizer_bk, offload_loader_bk,
+        local_feature_extractor, local_classifier, cloud_cnn,
+        b_star, scheduler_bk,
+        input_mode=input_mode, device=device,
+        epochs=offload_epochs, lr=1e-3, stop_threshold=0.95,
+        num_classes=num_classes,
+        dataset_name=dataset_name
+    )
+    
+    # ================================================================
+    # STEP 5: Train offload mechanism with Oracle labels
+    # ================================================================
+    print(f"\n[Step 4b] Training offload mechanism with ORACLE labels...")
+    
+    offload_model_oracle = OffloadMechanism(
+        input_mode=input_mode,
+        num_classes=num_classes
+    ).to(device)
+    
+    optimizer_oracle = torch.optim.Adam(offload_model_oracle.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler_oracle = ReduceLROnPlateau(optimizer_oracle, mode='max', factor=0.7, patience=5)
+    
+    train_deep_offload_mechanism(
+        offload_model_oracle, val_loader, optimizer_oracle, offload_loader_oracle,
+        local_feature_extractor, local_classifier, cloud_cnn,
+        b_star, scheduler_oracle,
+        input_mode=input_mode, device=device,
+        epochs=offload_epochs, lr=1e-3, stop_threshold=0.95,
+        num_classes=num_classes,
+        dataset_name=dataset_name
+    )
+    
+    # ================================================================
+    # STEP 6: Evaluate DDNN Overall Accuracy on TEST set
+    # ================================================================
+    print(f"\n[Step 5] Evaluating DDNN Overall Accuracy on TEST set...")
+    
+    offload_model_bk.eval()
+    offload_model_oracle.eval()
+    
+    bk_correct = 0
+    oracle_correct = 0
+    test_total = 0
+    
+    bk_local_test = 0
+    oracle_local_test = 0
+    
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            bs = labels.size(0)
+            
+            # Forward pass
+            local_feats = local_feature_extractor(images)
+            local_out = local_classifier(local_feats)
+            cloud_out = cloud_cnn(local_feats)
+            
+            # Prepare input for offload mechanism
+            if input_mode == 'logits':
+                dom_in = local_out
+            elif input_mode == 'logits_plus':
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+            elif input_mode == 'hybrid':
+                probs = F.softmax(local_out, dim=1)
+                num_cls = probs.size(1)
+                k = min(2, num_cls)
+                top_k = torch.topk(probs, k, dim=1).values
+                margin = (top_k[:, 0] - top_k[:, 1]).unsqueeze(1) if k == 2 else torch.zeros(bs, 1, device=device)
+                entropy = (-probs * torch.log(probs + 1e-9)).sum(dim=1, keepdim=True) / math.log(num_cls)
+                dom_in = torch.cat([local_out, margin, entropy], dim=1)
+            elif input_mode in ('feat', 'shallow_feat'):
+                dom_in = local_feats
+            else:
+                dom_in = local_out  # fallback
+            
+            # Get decisions from both models
+            if input_mode == 'hybrid':
+                bk_logits = offload_model_bk(dom_in, feat=local_feats)
+                oracle_logits = offload_model_oracle(dom_in, feat=local_feats)
+            else:
+                bk_logits = offload_model_bk(dom_in)
+                oracle_logits = offload_model_oracle(dom_in)
+            
+            bk_decisions = (torch.sigmoid(bk_logits).squeeze(1) > 0.5).float()
+            oracle_decisions_pred = (torch.sigmoid(oracle_logits).squeeze(1) > 0.5).float()
+            
+            # DDNN predictions
+            local_preds = local_out.argmax(dim=1)
+            cloud_preds = cloud_out.argmax(dim=1)
+            
+            # Final predictions
+            bk_final = torch.where(bk_decisions == 0, local_preds, cloud_preds)
+            oracle_final = torch.where(oracle_decisions_pred == 0, local_preds, cloud_preds)
+            
+            # Accuracy
+            bk_correct += (bk_final == labels).sum().item()
+            oracle_correct += (oracle_final == labels).sum().item()
+            test_total += bs
+            
+            # Local percentages
+            bk_local_test += (bk_decisions == 0).sum().item()
+            oracle_local_test += (oracle_decisions_pred == 0).sum().item()
+    
+    bk_accuracy = 100 * bk_correct / test_total
+    oracle_accuracy = 100 * oracle_correct / test_total
+    accuracy_diff = oracle_accuracy - bk_accuracy
+    
+    bk_local_test_pct = 100 * bk_local_test / test_total
+    oracle_local_test_pct = 100 * oracle_local_test / test_total
+    
+    print(f"\n  📊 DDNN OVERALL ACCURACY (TEST SET):")
+    print(f"  {'─'*50}")
+    print(f"  Cost-Based Rule training: {bk_accuracy:.2f}% (Local%: {bk_local_test_pct:.1f}%)")
+    print(f"  Oracle Labeling training: {oracle_accuracy:.2f}% (Local%: {oracle_local_test_pct:.1f}%)")
+    print(f"  {'─'*50}")
+    print(f"  Difference (Oracle - Cost): {accuracy_diff:+.2f}%")
+    
+    # ================================================================
+    # PLOTTING
+    # ================================================================
+    if plot:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        
+        # ========== LEFT PLOT: Noise Rate ==========
+        labels_left = ['Noise Rate\n(Mislabeled Samples)']
+        values_left = [noise_rate]
+        colors_left = ['#FF6B6B']
+        
+        bars1 = ax1.bar(labels_left, values_left, color=colors_left, alpha=0.8, width=0.4)
+        ax1.set_ylim(0, max(50, noise_rate + 10))
+        ax1.set_ylabel('Percentage (%)', fontsize=12, fontweight='bold')
+        ax1.set_title('Label Quality Metrics', fontsize=13, fontweight='bold')
+        ax1.grid(axis='y', linestyle='--', alpha=0.3)
+        
+        # Add value label
+        for bar, val in zip(bars1, values_left):
+            ax1.text(bar.get_x() + bar.get_width()/2, val + 1,
+                    f'{val:.1f}%', ha='center', va='bottom', fontsize=14, fontweight='bold')
+        
+        # Add explanation (moved lower to avoid overlap)
+        ax1.text(0, -15, 
+                f'Samples where Cost-Based Rule\ndisagrees with Oracle Rule', 
+                ha='center', fontsize=10, style='italic', color='#FF6B6B')
+        
+        # Add distribution info as text box
+        dist_text = (
+            f"Label Distribution:\n"
+            f"─────────────────────────\n"
+            f"Cost-Based: Local {bk_local_pct:.1f}%, Cloud {bk_cloud_pct:.1f}%\n"
+            f"Oracle:     Local {oracle_local_pct:.1f}%, Cloud {oracle_cloud_pct:.1f}%"
+        )
+        ax1.text(0.98, 0.98, dist_text, transform=ax1.transAxes,
+                fontsize=9, verticalalignment='top', horizontalalignment='right',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.8),
+                family='monospace')
+        
+        # ========== RIGHT PLOT: DDNN Accuracy Comparison ==========
+        methods = ['Cost-Based\nRule', 'Oracle\nLabeling']
+        accuracies = [bk_accuracy, oracle_accuracy]
+        colors_right = ['#3498DB', '#27AE60']
+        
+        bars2 = ax2.bar(methods, accuracies, color=colors_right, alpha=0.8, width=0.5)
+        ax2.set_ylim(min(accuracies) - 5, 100)
+        ax2.set_ylabel('DDNN Overall Accuracy (%)', fontsize=12, fontweight='bold')
+        ax2.set_title('Performance Comparison', fontsize=13, fontweight='bold')
+        ax2.grid(axis='y', linestyle='--', alpha=0.3)
+        
+        # Add value labels
+        for bar, acc in zip(bars2, accuracies):
+            ax2.text(bar.get_x() + bar.get_width()/2, acc + 0.5,
+                    f'{acc:.2f}%', ha='center', va='bottom', fontsize=14, fontweight='bold')
+        
+        # Add difference annotation
+        if accuracy_diff > 0:
+            ax2.annotate('', xy=(1, oracle_accuracy), xytext=(0, bk_accuracy),
+                        arrowprops=dict(arrowstyle='->', lw=2, color='green', alpha=0.6))
+            ax2.text(0.5, (bk_accuracy + oracle_accuracy)/2,
+                    f'+{accuracy_diff:.2f}%', ha='center', va='center',
+                    fontsize=12, fontweight='bold', color='green',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgreen', alpha=0.7))
+        
+        # Overall title
+        plt.suptitle(
+            f'Cost-Based vs Oracle Labeling Comparison\n'
+            f'(L0={L0:.2f}, {dataset_name.upper()}, Noise Rate={noise_rate:.1f}%)', 
+            fontsize=14, fontweight='bold'
+        )
+        
+        # Summary box at bottom
+        summary_text = (
+            f"Total: {N_total:,} training samples | "
+            f"Noise: {noise_rate:.1f}% | "
+            f"Test Accuracy: Cost-Based={bk_accuracy:.1f}%, Oracle={oracle_accuracy:.1f}%"
+        )
+        fig.text(0.5, 0.02, summary_text, ha='center', fontsize=10,
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        plt.tight_layout(rect=[0, 0.05, 1, 0.92])
+        
+        # Save plot
+        plots_dir = 'plots'
+        os.makedirs(plots_dir, exist_ok=True)
+        output_path = os.path.join(plots_dir, f'labeling_comparison_{dataset_name}_L0{int(L0*100)}.png')
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        
+        print(f"\n✓ Saved comparison plot: {output_path}")
+    
+    # ================================================================
+    # RETURN RESULTS
+    # ================================================================
+    return {
+        # Noise analysis
+        'noise_rate': noise_rate,
+        'agreement_rate': agreement_rate,
+        'total_samples': N_total,
+        # Label distributions
+        'bk_local_pct': bk_local_pct,
+        'bk_cloud_pct': bk_cloud_pct,
+        'oracle_local_pct': oracle_local_pct,
+        'oracle_cloud_pct': oracle_cloud_pct,
+        # DDNN Accuracy
+        'bk_ddnn_accuracy': bk_accuracy,
+        'oracle_ddnn_accuracy': oracle_accuracy,
+        'accuracy_difference': accuracy_diff,
+        # Test local percentages
+        'bk_local_test_pct': bk_local_test_pct,
+        'oracle_local_test_pct': oracle_local_test_pct,
+        # Threshold
+        'b_star': b_star
+    }
+
+
 
 

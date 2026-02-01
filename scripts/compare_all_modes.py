@@ -35,7 +35,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 DATASET_NAME = 'cifar10'
 BATCH_SIZE = 256
 
-L0_VALUES = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.55, 0.585, 0.6, 0.7, 0.9, 1] # Target local percentages (list for testing_offload_mechanism)
+L0_VALUES = [0, 0.1, 0.2, 0.3, 0.5, 0.585, 0.6, 0.7, 0.9, 1] # Target local percentages (list for testing_offload_mechanism)
 OFFLOAD_EPOCHS = 30
 NUM_CLASSES = 10
 LOGITS_ONLY_PREDICTOR = False
@@ -154,7 +154,7 @@ if __name__ == '__main__':
         train_loader=train_loader,
         test_loader=test_loader,
         val_loader=val_loader,
-        methods_to_test=['feat', 'logits', 'logits_plus+','random', 'entropy'],
+        methods_to_test=['logits', 'oracle', 'entropy'],
         device='cuda',
         offload_epochs=OFFLOAD_EPOCHS,
         batch_size=BATCH_SIZE,

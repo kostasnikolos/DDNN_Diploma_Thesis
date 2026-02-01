@@ -143,7 +143,7 @@ def main(
             train_loader=train_loader,
             test_loader=test_loader,
             val_loader=val_loader,
-            methods_to_test=['logits',  'entropy'],
+            methods_to_test=['logits',  'entropy', 'random','feat', 'logits_plus'],
             device='cuda',
             offload_epochs=epochs_optimization,
             batch_size=batch_size,
